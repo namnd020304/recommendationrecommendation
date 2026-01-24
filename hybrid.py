@@ -125,23 +125,38 @@ class WeightedHybridRecommender:
 
     def _get_collab_scores(self, user_id: int, candidate_movies: List[int]) -> Dict[int, float]:
         """
-        Lấy collaborative filtering scores
+        Lấy collaborative filtering scores với proper normalization
         """
         try:
             collab_scores = {}
 
             for movie_id in candidate_movies:
-                # Predict rating
+                # Predict rating (range: 0.5 - 5.0)
                 pred_rating = self.collab_rec.predict_rating(user_id, movie_id)
 
                 if pred_rating is not None:
-                    # Normalize to [0, 1] (ratings are 0.5-5.0)
-                    norm_score = (pred_rating - 0.5) / 4.5
-                    collab_scores[movie_id] = norm_score
+                    collab_scores[movie_id] = pred_rating
                 else:
-                    collab_scores[movie_id] = 0.0
+                    # Fallback to average rating
+                    collab_scores[movie_id] = 3.0
 
-            return collab_scores
+            # ✅ PHẦN MỚI: Normalize ALL scores to [0, 1] range
+            if collab_scores:
+                scores_array = np.array(list(collab_scores.values()))
+                min_score = scores_array.min()
+                max_score = scores_array.max()
+
+                if max_score > min_score:
+                    # Min-max normalization
+                    normalized_scores = {}
+                    for movie_id, score in collab_scores.items():
+                        normalized_scores[movie_id] = (score - min_score) / (max_score - min_score)
+                    return normalized_scores
+                else:
+                    # All scores are the same
+                    return {m: 0.5 for m in collab_scores.keys()}
+
+            return {}
 
         except Exception as e:
             warnings.warn(f"Collab scoring failed: {str(e)}")
