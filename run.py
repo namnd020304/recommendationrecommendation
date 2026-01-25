@@ -69,7 +69,7 @@ def run_full_evaluation(n_test_users: int = 100, k_values: list = [5, 10, 20]):
     print("\n[STEP 5] Running comprehensive evaluation...")
     print(f"Testing on {len(test_users)} users with K values: {k_values}")
 
-    results = evaluator.comprehensive_evaluation(
+    results = evaluator.comprehensive_evaluation_optimized(
         test_users=test_users,
         test_ratings=test_ratings,
         methods=['content', 'collab', 'hybrid'],

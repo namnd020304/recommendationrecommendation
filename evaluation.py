@@ -554,6 +554,224 @@ class RecommenderEvaluator:
         results_df.to_csv(filepath, index=False)
         print(f"\nResults saved to {filepath}")
 
+    def comprehensive_evaluation_optimized(self,
+                                           test_users: List[int],
+                                           test_ratings: pd.DataFrame,
+                                           methods: List[str] = ['content', 'collab', 'hybrid'],
+                                           k_values: List[int] = [5, 10, 20]) -> pd.DataFrame:
+        """
+        OPTIMIZED: Cache recommendations để tránh tính lại
+        """
+        print("\n" + "=" * 70)
+        print("COMPREHENSIVE EVALUATION (OPTIMIZED)")
+        print("=" * 70)
+
+        results = []
+        max_k = max(k_values)
+
+        for method in methods:
+            print(f"\n{'=' * 70}")
+            print(f"EVALUATING METHOD: {method.upper()}")
+            print(f"{'=' * 70}")
+
+            # ✅ Pre-generate tất cả recommendations 1 lần
+            print(f"Pre-generating recommendations for {len(test_users)} users...")
+            recommendations_cache = {}
+
+            for idx, user_id in enumerate(test_users):
+                if idx % 20 == 0:
+                    print(f"  Progress: {idx}/{len(test_users)}")
+
+                try:
+                    recs = self.manager.recommend(
+                        user_id,
+                        method=method,
+                        top_n=max_k,
+                        exclude_watched=True
+                    )
+                    recommendations_cache[user_id] = recs
+                except Exception as e:
+                    recommendations_cache[user_id] = pd.DataFrame()
+
+            print(f"✅ Cached {len(recommendations_cache)} recommendations")
+
+            # Evaluate cho từng k value
+            for k in k_values:
+                print(f"\n--- K = {k} ---")
+                start_time = time.time()
+
+                # ✅ Sử dụng cache
+                pr_results = self._precision_recall_cached(
+                    test_users, test_ratings, recommendations_cache, k
+                )
+
+                div_results = self._diversity_cached(
+                    test_users, recommendations_cache, k
+                )
+
+                cov_results = self._coverage_cached(
+                    test_users, recommendations_cache, k
+                )
+
+                nov_results = self._novelty_cached(
+                    test_users, recommendations_cache, k
+                )
+
+                elapsed = time.time() - start_time
+
+                row = {
+                    'method': method,
+                    'k': k,
+                    'precision': pr_results['precision@k'],
+                    'recall': pr_results['recall@k'],
+                    'f1': pr_results['f1@k'],
+                    'diversity': div_results['intra_list_diversity'],
+                    'genre_count': div_results['avg_genre_count'],
+                    'catalog_coverage': cov_results['catalog_coverage'],
+                    'user_coverage': cov_results['user_coverage'],
+                    'novelty': nov_results['novelty'],
+                    'eval_time_sec': elapsed
+                }
+
+                results.append(row)
+
+        results_df = pd.DataFrame(results)
+        print("\n" + "=" * 70)
+        print("SUMMARY TABLE")
+        print("=" * 70)
+        print(results_df.to_string(index=False))
+
+        return results_df
+
+    def _precision_recall_cached(self, test_users, test_ratings, recommendations_cache, k):
+        precisions = []
+        recalls = []
+        successful_users = 0
+
+        for user_id in test_users:
+            user_test = test_ratings[test_ratings['userId'] == user_id]
+            relevant_items = set(user_test[user_test['rating'] >= 4.0]['movieId'].values)
+
+            if len(relevant_items) == 0:
+                continue
+
+            recs = recommendations_cache.get(user_id, pd.DataFrame())
+
+            if isinstance(recs, pd.DataFrame) and len(recs) > 0:
+                recommended_items = set(recs['movieId'].values[:k])
+                hits = recommended_items & relevant_items
+
+                precision = len(hits) / k if k > 0 else 0
+                recall = len(hits) / len(relevant_items) if len(relevant_items) > 0 else 0
+
+                precisions.append(precision)
+                recalls.append(recall)
+                successful_users += 1
+
+        avg_precision = np.mean(precisions) if precisions else 0
+        avg_recall = np.mean(recalls) if recalls else 0
+        f1 = 2 * (avg_precision * avg_recall) / (avg_precision + avg_recall) if (avg_precision + avg_recall) > 0 else 0
+
+        return {
+            'precision@k': avg_precision,
+            'recall@k': avg_recall,
+            'f1@k': f1,
+            'evaluated_users': successful_users
+        }
+
+    def _diversity_cached(self, test_users, recommendations_cache, k):
+        intra_list_diversities = []
+        genre_diversities = []
+
+        for user_id in test_users:
+            recs = recommendations_cache.get(user_id, pd.DataFrame())
+
+            if not isinstance(recs, pd.DataFrame) or len(recs) < 2:
+                continue
+
+            movie_ids = recs['movieId'].values[:k]
+            genres_set = set()
+            genre_lists = []
+
+            for mid in movie_ids:
+                movie_info = self.manager.content_model.movies[
+                    self.manager.content_model.movies['movieId'] == mid
+                    ]
+
+                if len(movie_info) > 0:
+                    genres = movie_info.iloc[0]['genres'].split('|')
+                    genres_set.update(genres)
+                    genre_lists.append(set(genres))
+
+            genre_diversities.append(len(genres_set))
+
+            pairwise_distances = []
+            for i in range(len(genre_lists)):
+                for j in range(i + 1, len(genre_lists)):
+                    intersection = len(genre_lists[i] & genre_lists[j])
+                    union = len(genre_lists[i] | genre_lists[j])
+
+                    if union > 0:
+                        jaccard_dist = 1 - (intersection / union)
+                        pairwise_distances.append(jaccard_dist)
+
+            if pairwise_distances:
+                intra_list_diversities.append(np.mean(pairwise_distances))
+
+        return {
+            'intra_list_diversity': np.mean(intra_list_diversities) if intra_list_diversities else 0,
+            'avg_genre_count': np.mean(genre_diversities) if genre_diversities else 0,
+            'evaluated_users': len(intra_list_diversities)
+        }
+
+    def _coverage_cached(self, test_users, recommendations_cache, k):
+        all_recommended_movies = set()
+        users_with_k_recs = 0
+
+        for user_id in test_users:
+            recs = recommendations_cache.get(user_id, pd.DataFrame())
+
+            if isinstance(recs, pd.DataFrame) and len(recs) > 0:
+                recommended = recs['movieId'].values[:k]
+                all_recommended_movies.update(recommended)
+
+                if len(recommended) >= k:
+                    users_with_k_recs += 1
+
+        total_movies = self.ratings['movieId'].nunique()
+
+        return {
+            'catalog_coverage': len(all_recommended_movies) / total_movies,
+            'user_coverage': users_with_k_recs / len(test_users),
+            'unique_movies_recommended': len(all_recommended_movies),
+            'total_movies': total_movies
+        }
+
+    def _novelty_cached(self, test_users, recommendations_cache, k):
+        novelties = []
+
+        for user_id in test_users:
+            recs = recommendations_cache.get(user_id, pd.DataFrame())
+
+            if not isinstance(recs, pd.DataFrame) or len(recs) == 0:
+                continue
+
+            movie_ids = recs['movieId'].values[:k]
+            user_novelties = []
+
+            for mid in movie_ids:
+                if mid in self.movie_popularity:
+                    pop = self.movie_popularity[mid]
+                    novelty = -np.log2(pop + 1e-10)
+                    user_novelties.append(novelty)
+
+            if user_novelties:
+                novelties.append(np.mean(user_novelties))
+
+        return {
+            'novelty': np.mean(novelties) if novelties else 0,
+            'evaluated_users': len(novelties)
+        }
 
 # ===== USAGE EXAMPLE =====
 if __name__ == "__main__":
